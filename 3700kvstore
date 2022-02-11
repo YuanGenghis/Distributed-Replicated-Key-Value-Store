@@ -1,0 +1,274 @@
+#!/usr/bin/env python
+import sys, socket, select, time, json, random
+
+
+
+# Your ID number
+my_id = sys.argv[1]
+# The ID numbers of all the other replicas
+replica_ids = sys.argv[2:]
+
+
+# Connect to the network. All messages to/from other replicas and clients will
+# occur over this socket
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+sock.connect(my_id)
+last = 0
+
+
+
+
+
+class node_system:
+    def __init__(self):
+        self.term = 0
+        self.selectVote = None
+        self.votes = dict()
+        self.leader = 'FFFF'
+        self.data = {}
+        self.log = []
+        self.electionTimeout = random.uniform(0.15, 0.15 * 2.0)
+        self.electionTime = None
+        self.heartbeatTime = None
+        self.commitIndex = 0
+        self.lastApplied = 0
+
+        self.electionList = list()
+
+        self.nextEntry = {}
+        self.rightEntry= {}
+        self.rpc = {}
+
+    def handleMessage(self, msg_raw):
+        try:
+            msg = json.loads(msg_raw)
+            if self.leader == 'FFFF' and msg['type'] in ['get', 'put']:
+                self.electionList.append(msg_raw)
+            elif msg['type'] == 'get':
+                if self.leader != my_id:
+                    message = {'src': my_id, 'dst': msg['src'], 'leader': self.leader, 'type': 'redirect', 'MID': msg['MID']}
+                    sock.send(json.dumps(message))
+                else:   
+                    if msg['key'] in self.data:
+                        message = {'src': my_id, 'dst': msg['src'], 'leader': self.leader, 'type': 'ok', 'MID': msg['MID'], 'value': self.data[msg['key']]}
+                        sock.send(json.dumps(message))
+                    else:
+                        message = {'src': my_id, 'dst': msg['src'], 'leader': self.leader, 'type': 'ok', 'MID': msg['MID'], 'value': ''}
+                        sock.send(json.dumps(message))
+            elif msg['type'] == 'put':
+                if self.leader != my_id:
+                    message = {'src': my_id, 'dst': msg['src'], 'leader': self.leader, 'type': 'redirect', 'MID': msg['MID']}
+                    sock.send(json.dumps(message))
+                else:
+                    self.log.append({
+                        'term': self.term,
+                        'key': msg['key'],
+                        'value': msg['value'],
+                        'src': msg['src'],
+                        'mid': msg['MID'],
+                        'received_by': my_id
+                        })
+            elif msg['type'] == 'appendEntries':
+                self.appendEntries(msg)
+            elif msg['type'] == 'appendEntriesReply':
+                if self.leader == my_id:
+                    if msg['success']:
+                        n = self.rpc[msg['src']][0]
+                        self.rpc[msg['src']] = (0, None)
+                        self.nextEntry[msg['src']] += n
+                        self.rightEntry[msg['src']] = self.nextEntry[msg['src']] - 1
+                    else:
+                        if msg['term'] > self.term:
+                            self.term = msg['term']
+                            self.leader = msg['src']
+                        else:
+                            self.nextEntry[msg['src']] -= 1
+            elif msg['type'] == 'requestVote':
+                self.requestVote(msg)
+            elif msg['type'] == 'vote':
+                if self.term < msg['term']:
+                    self.term = msg['term']
+                    self.electionReset()
+                if self.leader != my_id and self.term == msg['term'] and self.selectVote == my_id:
+                    self.votes[msg['src']] = msg['vote']
+                    vote_count = 0
+                    for vote in self.votes.values():
+                        if vote: vote_count += 1
+                    if vote_count > (len(replica_ids) + 1) / 2:
+                        self.leader = my_id
+                        for follower in replica_ids:
+                            self.nextEntry[follower] = len(self.log)
+                            self.rightEntry[follower] = 0
+                            self.rpc[follower] = (0, None)
+                        self.sendHeartbeat()
+                        for msg in self.electionList:
+                            self.handleMessage(msg)
+                        self.electionList = list()
+        except (ValueError, KeyError, TypeError) as e:
+            pass
+
+    
+    def sendHeartbeat(self):
+        message = {'src': my_id, 'dst': 'FFFF', 'leader': self.leader, 
+        'type': 'appendEntries', 'term': self.term,
+        'entries': [], 'leaderCommit': self.commitIndex,
+        'prevLogTerm': 'TODO', 'prevLogIndex': 'TODO'}
+        sock.send(json.dumps(message))
+        self.heartbeatTime = time.time()
+    
+    def update(self):
+        lastIndex = len(self.log) - 1
+        for follower, nextEntry in self.nextEntry.iteritems():
+            if (lastIndex >= nextEntry and
+                    (self.rpc[follower][1] is None or
+                        ((time.time() - self.rpc[follower][1]) > 0.02))):
+                self.sendEntry(follower)
+        
+        newIndex = self.commitIndex + 1
+        while newIndex < len(self.log):
+            confirms = 1
+            for f, idx in self.rightEntry.iteritems():
+                if idx >= newIndex:
+                    confirms += 1
+            if confirms > (len(replica_ids) + 1) / 2:
+                if self.log[newIndex]['term'] == self.term:
+                    self.commitIndex = newIndex
+                newIndex += 1
+            else:
+                break
+    
+    def sendEntry(self, follower):
+        prevIndex = self.nextEntry[follower] - 1
+        entries = self.log[prevIndex + 1:prevIndex + 50]
+        prevLogTerm = self.log[prevIndex]['term']
+        message = { 'src': my_id,
+                'dst': follower,
+                'leader': self.leader,
+                'type': 'appendEntries',
+                'term': self.term,
+                'entries': entries,
+                'leaderCommit': self.commitIndex,
+                'prevLogTerm': prevLogTerm,
+                'prevLogIndex': prevIndex
+            }
+        self.rpc[follower] = (len(entries), time.time())
+        sock.send(json.dumps(message))
+
+    def electionReset(self):
+        self.leader = 'FFFF'
+        self.votes = dict()
+        self.selectVote = None
+    
+    def commit(self):
+        while self.commitIndex > self.lastApplied:
+            self.lastApplied += 1
+            entry = self.log[self.lastApplied]
+            self.data[entry['key']] = entry['value']
+            if self.leader == my_id:
+                message = {'src': my_id, 'dst': entry['src'], 'leader': self.leader, 'type': 'ok', 'MID': entry['mid']}
+                sock.send(json.dumps(message))
+
+    def appendEntries(self, msg):
+        self.electionTime = time.time()
+        if self.term <= msg['term']:
+            self.term = msg['term']
+            self.leader = msg['leader']
+            for msg in self.electionList:
+                self.handleMessage(msg)
+            self.electionList = list()
+        
+        if len(msg['entries']) == 0:
+            return
+
+        entryMsg = {
+                'src': my_id,
+                'dst':msg['src'],
+                'leader': self.leader,
+                'type': 'appendEntriesReply',
+                'term': self.term
+                }
+        if self.term > msg['term']:
+            entryMsg['success'] = False
+        elif (msg['prevLogIndex'] >= 0 and
+                (len(self.log) <= msg['prevLogIndex'] or
+                    self.log[msg['prevLogIndex']]['term'] != msg['prevLogTerm'])):
+            entryMsg['success'] = False
+        else:
+            prevIndex = msg['prevLogIndex']
+            index = 0
+            for num, entry in enumerate(self.log[prevIndex + 1:]):
+                if len(msg['entries']) > num and entry['term'] == msg['entries'][num]['term']:
+                    prevIndex += 1
+                    index += 1
+                else:
+                    break
+            for entry in self.log[prevIndex + 1:]:
+                if entry['received_by'] == my_id:
+                    message = {'src': my_id, 'dst': entry['src'], 'leader': self.leader, 'type': 'redirect', 'MID': entry['mid']}
+                    sock.send(json.dumps(message))
+            self.log = self.log[:prevIndex + 1]
+            for entry in msg['entries'][index:]:
+                self.log.append(entry)
+            if msg['leaderCommit'] > self.commitIndex:
+                self.commitIndex = min(len(self.log) - 1, msg['leaderCommit'])
+            entryMsg['success'] = True
+        sock.send(json.dumps(entryMsg))
+
+    def requestVote(self, msg):
+        voteResult = False
+        if msg['term'] > self.term:
+            self.selectVote = None
+            self.term = msg['term']
+
+        ifVoted = self.selectVote is None or self.selectVote == msg['src']
+        lastLogIndex = len(self.log) - 1
+        lastLogTerm = self.log[lastLogIndex]['term'] if lastLogIndex >= 0 else -1
+        ifUpdated = False
+        if msg['lastLogTerm'] > lastLogTerm:
+            ifUpdated = True
+        elif msg['lastLogTerm'] == lastLogTerm:
+            if msg['lastLogIndex'] >= lastLogIndex:
+                ifUpdated = True
+        if ifVoted and ifUpdated:
+            voteResult = True
+            self.selectVote = msg['src']
+        message = {'src': my_id, 'dst': msg['src'], 'leader': self.leader, 'type': 'vote', 'vote': voteResult, 'term': self.term}
+        sock.send(json.dumps(message))
+        self.electionTime = time.time()
+
+
+
+
+if __name__ == '__main__':
+    node = node_system()
+    node.electionTime = time.time()
+    node.heartbeatTime = time.time()
+
+    #listen to message
+    while True:
+        node.commit()
+        ready = select.select([sock], [], [], 0.01)[0]
+        
+        if sock in ready:
+            msg_raw = sock.recv(32768)
+            
+            if len(msg_raw) != 0:
+                node.handleMessage(msg_raw)
+            
+        if node.leader == my_id:
+            if (time.time() - node.heartbeatTime) > 0.075:
+                node.sendHeartbeat()
+            node.update()
+        else:
+            if (time.time() - node.electionTime) > node.electionTimeout:
+                node.electionReset()
+                node.term += 1
+                node.selectVote = my_id
+                node.votes[my_id] = True
+                node.electionTime = time.time()
+                lastLogIndex = len(node.log) - 1
+                lastLogTerm = node.log[-1]['term'] if lastLogIndex >= 0 else -1
+                request_vote_msg = {'src': my_id, 'dst': 'FFFF', 'leader': node.leader, 'type': 'requestVote', 'term': node.term, 'lastLogIndex': lastLogIndex, 'lastLogTerm': lastLogTerm}
+                sock.send(json.dumps(request_vote_msg))
+
+
